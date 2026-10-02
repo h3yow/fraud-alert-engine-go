@@ -3,11 +3,13 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"time"
 
 	"github.com/h3yow/fraud-alert-engine-go/internal/alert"
+	"github.com/h3yow/fraud-alert-engine-go/internal/backfill"
 	"github.com/h3yow/fraud-alert-engine-go/internal/domain"
 	"github.com/h3yow/fraud-alert-engine-go/internal/engine"
 	"github.com/h3yow/fraud-alert-engine-go/internal/logging"
@@ -104,6 +106,55 @@ func main() {
 	}
 	fmt.Printf("sum(unique_hits across alerts)=%d; number of alerts=%d\n",
 		totalUniqueHits, len(p.Alerts()))
+
+	// 10) Historical batch backfill: an unordered, duplicate-laden chunk of
+	//     old transactions is spilled to disk, replayed in business-time
+	//     order and merged with the live pipeline; a second run of the same
+	//     session is a no-op (resumable, nothing re-counted).
+	dir, err := os.MkdirTemp("", "backfill-demo")
+	if err != nil {
+		panic(err)
+	}
+	defer os.RemoveAll(dir)
+	bf := backfill.New(p, backfill.Options{Dir: dir, Logger: logger})
+	sess, err := bf.Begin("demo-history")
+	if err != nil {
+		panic(err)
+	}
+	hist := []domain.Transaction{
+		tx("H-003", base.Add(-30*24*time.Hour), "acct-H", "ZZ", 500), // old block
+		tx("H-001", base.Add(-32*24*time.Hour), "acct-H", "US", 60000),
+		tx("H-002", base.Add(-31*24*time.Hour), "acct-H", "US", 25),
+		tx("H-003", base.Add(-30*24*time.Hour), "acct-H", "ZZ", 500), // in-batch duplicate
+		tx("013", base.Add(40*time.Second), "acct-B", "US", 10),      // already processed: absorbed
+	}
+	if err := sess.Submit(hist); err != nil {
+		panic(err)
+	}
+	st, err := sess.Run(context.Background())
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("\n>>> backfill run #1: submitted=%d applied=%d skipped=%d done=%v\n",
+		st.Submitted, st.Applied, st.Skipped, st.Done)
+	for _, id := range []string{"E-H-001", "E-H-002", "E-H-003"} {
+		if v, ok := p.Verdict(id); ok {
+			fmt.Printf("    backfilled event=%s verdict=%s late=%v alert=%s\n", id, v.Action, v.IsLate, v.AlertKey)
+		}
+	}
+	st2, err := sess.Run(context.Background())
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf(">>> backfill run #2 (resume after completion): applied=%d done=%v (no re-count)\n",
+		st2.Applied, st2.Done)
+
+	fmt.Println("\n===== alerts after backfill =====")
+	for _, a := range p.Alerts() {
+		fmt.Printf("key=%-42s rule=%-24s account=%s state=%-8s unique_hits=%d first=%s last=%s\n",
+			a.Key, a.RuleID, a.AccountID, a.State, a.HitCount,
+			a.FirstSeen.Format(time.RFC3339), a.LastSeen.Format(time.RFC3339))
+	}
 }
 
 func winner(v domain.Verdict) string {

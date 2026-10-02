@@ -13,8 +13,9 @@
 | `internal/engine` | 输入校验、必需规则检查、panic/error 隔离、多规则优先级裁决 |
 | `internal/alert` | 去重键、告警聚合、EventID 集合计数、单向状态机 |
 | `internal/processor` | 总装管线：幂等去重、迟到水位线、告警装配、对外入口 |
+| `internal/backfill` | 历史流水批量回填：分批落盘、归并重放、断点续跑 |
 | `internal/logging` | 标准库 logger 与线程安全内存 logger（供测试断言） |
-| `cmd/demo` | 本地演示：正常/冲突/重复/乱序/迟到/降级/状态流转全场景 |
+| `cmd/demo` | 本地演示：正常/冲突/重复/乱序/迟到/降级/状态流转/批量回填全场景 |
 
 ## 规则与优先级
 
@@ -90,6 +91,58 @@ OPEN ──Ack──▶ ACKED ──Resolve──▶ RESOLVED(终态)
 - 有状态规则（velocity）按账户维护 `EventID -> OccurredAt` 集合，在
   `(t-Window, t]` 业务时间窗口内计数，重复 EventID 被集合吸收。
 
+## 历史流水批量回填（backfill）
+
+`internal/backfill` 在实时管线之上提供可断点续跑的历史批量回填，用于把
+跨度大、批内乱序、夹带重复的存量流水补进同一个 `Processor`。
+
+### 使用方式
+
+```go
+bf := backfill.New(proc, backfill.Options{
+    Dir:         "/var/lib/fraud/backfill", // 会话状态（run 文件 + 断点）持久化目录
+    Logger:      logger,
+    MaxOpenRuns: 32,                         // 归并路数上限，超出自动压实
+})
+sess, _ := bf.Begin("2026-09-history")       // 同 id 重复 Begin 即"续跑"
+for chunk := range chunkSource {             // 每块任意乱序、可含重复
+    sess.Submit(chunk)                       // 块内排序后落盘为 sorted run
+}
+st, _ := sess.Run(ctx)                       // 全局归并，按业务时间重放；ctx 取消即安全停止
+fmt.Println(st.Applied, st.Done)
+```
+
+- **内存有界**：`Submit` 只把当前一块排序落盘；`Run` 做 k 路归并，内存占用
+  为"每路一条记录"。run 文件数超过 `MaxOpenRuns` 时自动压实（同样是流式
+  归并），因此可以处理明显大于内存的批量数据。
+- **断点续跑**：每应用一笔就把游标 `(OccurredAt, EventID)` 原子写入
+  `checkpoint.json`（tmp + rename）。`ctx` 取消、进程停止后，用同一
+  session id 重新 `Begin` + `Run` 即可从断点继续：已处理的跳过不重计，
+  未处理的不漏。
+- **一致性承诺**：回填结束后，每一笔的定论、命中规则、归属告警与计数，
+  与"这批数据去重后按业务时间从早到晚逐条走正常实时路径"完全一致
+  （`TestBackfillMatchesSequentialByBusinessTime` 逐事件、逐告警对比）。
+
+### 与实时处理/告警聚合的兼容边界
+
+- **并发安全**：回填走 `Processor.ProcessHistorical`，与实时
+  `Process` 共用同一把处理器锁——同一 EventID 无论从哪条路径先到，
+  只有第一次评估生效，之后一律回放缓存判定，不会出现两个结论；
+  告警侧靠 EventID 集合去重，计数不重复也不丢。
+- **不凭空标异常**：历史事件按业务时间重放，永不标记 `IsLate`；水位线
+  只单调前进，回填结束后新来实时事件的迟到判断基于最新业务时间平滑
+  衔接。
+- **不回退**：告警计数只增不减、`FirstSeen/LastSeen` 维持业务时间
+  最小/最大语义（回填更早的历史事件可能合法地把 `FirstSeen` 提前，这是
+  补齐真实最小值而非回退）、告警状态机不受回填影响。
+- **同一笔只算一次**：批内重复在归并时消除；与实时路径撞车的 EventID
+  由处理器幂等缓存吸收。
+- **提交顺序约束**：会话产生已应用进度后，新 `Submit` 的块必须整体晚于
+  进度游标，否则返回错误（宁可显式拒绝也不静默丢数据）。
+- **崩溃窗口（诚实声明）**：若在"应用一笔"与"落盘断点"之间的极窄窗口
+  内硬崩溃，重启后最多重放该笔；由于规则状态按 EventID 幂等、告警按
+  EventID 集合去重，重放不会产生第二次计数。
+
 ## 日志可解释性
 
 每个事件均打印：输入（event/tx/账户/簇/金额/币种/国家/业务时间/摄入时间/
@@ -103,9 +156,10 @@ late 标记）→ 每条命中（规则、优先级、动作、降级标记、�
 go build ./...          # 编译全部包与 demo
 go vet ./...            # 静态检查
 go test ./...           # 单元 + 端到端测试
-go test -race ./...     # 竞态检测（并发重复投递）
+go test -race ./...     # 竞态检测（并发重复投递、回填与实时并发）
+go test -v ./internal/backfill/   # 回填场景明细日志（场景、游标、计数、结论）
 go test -cover ./...    # 覆盖率（engine/processor >96%，rule/alert >89%）
-go run ./cmd/demo       # 交互式场景演示，末尾打印告警与计数守恒汇总
+go run ./cmd/demo       # 交互式场景演示，末尾含批量回填与续跑演示
 ```
 
 测试覆盖矩阵：
@@ -124,6 +178,13 @@ go run ./cmd/demo       # 交互式场景演示，末尾打印告警与计数守
 | 状态机单向、终态拒绝 | `TestStateMachineOneWay`、`TestManualReviewStateFlowEndToEnd` |
 | 簇合并 / 冷却桶 | `TestClusterMergesAcrossRules`、`TestCooldownBucketing` |
 | 日志含输入与判定依据 | `TestLoggingContainsInputAndBasis` |
+| 批量回填 ⇔ 按业务时间逐条处理等价 | `TestBackfillMatchesSequentialByBusinessTime` |
+| 批内乱序+重复、分块落盘与压实 | `TestBackfillChunkedStreamingAndGuards` |
+| 回填中途停止、重启续跑、计数守恒 | `TestBackfillStopAndResumeCountConservation` |
+| 回填与实时并发：定论唯一、计数守恒、无回退 | `TestBackfillConcurrentWithRealtime` |
+
+回填测试运行时通过 `go test -v ./internal/backfill/` 可看到每个场景的
+输入规模、断点游标、应用/跳过计数与 PASS 结论（`scenario=...` 日志行）。
 
 ## 设计边界（诚实声明）
 
