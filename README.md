@@ -12,9 +12,11 @@
 | `internal/rule` | 规则接口、注册表、三条内置规则与默认规则集 |
 | `internal/engine` | 输入校验、必需规则检查、panic/error 隔离、多规则优先级裁决 |
 | `internal/alert` | 去重键、告警聚合、EventID 集合计数、单向状态机 |
-| `internal/processor` | 总装管线：幂等去重、迟到水位线、告警装配、对外入口 |
+| `internal/processor` | 总装管线：幂等去重、迟到水位线、告警装配、对外入口（含历史回填摄入入口） |
+| `internal/backfill` | 历史流水批量回填：分块外部排序、k 路归并、微批检查点、暂停/重启续跑 |
 | `internal/logging` | 标准库 logger 与线程安全内存 logger（供测试断言） |
 | `cmd/demo` | 本地演示：正常/冲突/重复/乱序/迟到/降级/状态流转全场景 |
+| `cmd/backfill-demo` | 回填端到端演示：乱序+重复+大跨度 JSONL 批次、暂停续跑、与升序参考流逐笔比对 |
 
 ## 规则与优先级
 
@@ -90,6 +92,79 @@ OPEN ──Ack──▶ ACKED ──Resolve──▶ RESOLVED(终态)
 - 有状态规则（velocity）按账户维护 `EventID -> OccurredAt` 集合，在
   `(t-Window, t]` 业务时间窗口内计数，重复 EventID 被集合吸收。
 
+## 历史流水批量回填 (`internal/backfill`)
+
+在实时管线之上新增一层回填能力，解决"一大批业务时间跨度很大、批内乱序、还夹着
+重复的旧流水"无法逐条喂入、中途失败无法续跑的问题。
+
+### 用法
+
+```go
+store, _   := backfill.NewDiskStore("/var/lib/fraud/backfill") // 或 backfill.NewMemStore()
+runner     := backfill.NewRunner(store, logger)
+result, err := runner.Run(ctx, processor, backfill.Config{
+    JobID:          "reconcile-2026Q2", // 续跑时复用同一 JobID
+    ChunkSize:      10_000,             // 排序阶段单块内存上限
+    MicroBatchSize: 500,                // 归并阶段检查点节奏
+    Source:         backfill.NewJSONLFileReader("history.jsonl"),
+})
+```
+
+输入源只需实现可重复打开的 `InputReader`（内置 JSONL 文件读取器
+`NewJSONLFileReader` 与内存切片适配器 `SliceReader`）。每行 JSON：
+
+```json
+{"seq": 1, "tx": {"event_id": "e1", "tx_id": "t1", "account_id": "a1",
+                  "amount": 50, "currency": "USD", "country": "US",
+                  "event_type": "PAY",
+                  "occurred_at": "2026-06-01T00:00:00Z",
+                  "ingested_at": "2026-06-01T00:00:01Z"}}
+```
+
+`seq` 可省略（按行号生成）。`(OccurredAt, EventID, Seq)` 构成全序游标，即使同
+EventID 同业务时间也能唯一定位。
+
+暂停/续跑：`ctx` 取消是协作式的——当前块/微批写完、检查点落盘后返回
+`Paused=true`；用同一 `JobID` 再次 `Run` 即从上次提交点继续。进程重启后用
+`RestoreInto(ctx, 新processor, jobID)` 把块按归并顺序重放一遍重建引擎/告警状态
+（processor 的 EventID 幂等保证重放恰好一次），随后再 `Run` 收尾。
+
+### 与"逐条升序正常处理"的等价性是怎么做到的
+
+1. **排序阶段（外部排序）**：读源，内存缓冲到 `ChunkSize` 就排序落盘成一个
+   chunk（JSONL），`ChunkSize` 即内存上限——批大小只影响 chunk 数量，不影响
+   内存峰值。每个 chunk 落盘都更新清单，排序中途崩溃也能跳过已落盘前缀。
+2. **归并阶段（k 路最小堆）**：同时打开所有 chunk，每路只保留堆顶一条，按
+   `(OccurredAt, EventID, Seq)` 全局升序吐出记录。因此摄入 processor 的顺序
+   严格等价于"这批数据按业务时间从早到晚一条条喂"。
+3. **去重不额外造状态**：批内重复（同 EventID 多条）交给 processor 已有的
+   EventID 幂等层吸收——升序流里最早出现的那笔成为权威判定，后续重放返回相同
+   Verdict、不重复计数。velocity 规则对已知 EventID 只保留最早业务时间，保证
+   "同 EventID 更晚时间的重复副本"不污染窗口状态。
+4. **微批检查点**：每 `MicroBatchSize` 条提交一次清单（游标、累计 applied/
+   duplicate 数、历史高水位、告警操作状态）。续跑时跳过 `<= cursor` 的记录。
+
+`TestBackfillEquivalentToAscendingReference` 对一个乱序、重复、跨两个月的批次
+逐字段比对两种路径（动作/获胜规则/全部命中/告警键/每告警 HitCount/FirstSeen/
+LastSeen）完全一致。
+
+### 与实时处理、告警聚合的兼容边界
+
+| 主题 | 保证 |
+| --- | --- |
+| 回填期间实时并发 | 回填走独立入口 `IngestHistorical`，与 `Process` 共用同一把 processor 锁与同一张 EventID 幂等表；同一 EventID 无论从哪条路径先到，只有一个权威结论（另一路径等待并回放），告警计数不重不丢。见 `TestBackfillConcurrentWithLive`、`TestConcurrentHistoricalAndLiveSameEvent`（`-race` 验证）。 |
+| 迟到/乱序平滑衔接 | 回填期间**不**因实时水位线远高于历史时间而把历史事件误标 late（否则补旧数据会把所有正常事件标成异常）；回填期间实时水位线照常推进。回填**完成后**才用历史高水位**单调抬升**实时水位线——只升不降，所以纯历史回填不会让既有 late 判断、告警计数、首末时间或状态发生回退。见 `TestHistoricalIngestionNotFlaggedLateAndSeamsWatermark`、`TestWatermarkAdvancedForwardAfterNewerBackfill`。 |
+| 告警聚合 | 回填产生的告警与实时告警进入同一个 `alert.Store`、同一套 `(规则,账户,冷却桶)/cluster` 去重键；EventID 集合计数天然吸收跨路径重复。回填把某条已存在告警的 FirstSeen 向更早修正、或把 HitCount 补齐到"完整输入本该有的值"，这是与参考终态对齐，而非状态回退；操作状态（ACKED/RESOLVED）只在单向状态机上向前合并，检查点里持久化的 Ack/Resolve 在重启重放后不丢失（`TestBackfillRestartPreservesAlertState`）。 |
+| 重复出现的同一笔 | 批内多次、跨批次、历史与实时重叠，统一只算一次（最早业务时间的副本权威）。 |
+| 计数守恒 | 暂停 N 次后续跑、甚至换进程重放重建，最终每条告警 `HitCount = 唯一 EventID 数`，applied + 幂等吸收数守恒（`TestBackfillPauseAndResumeConservesCounts`、`TestBackfillRestartRebuildsProcessor`）。 |
+
+**诚实边界**：回填的等价性是针对"被回填的这批数据 + 已落定状态"按业务时间升序
+的终态；回填进行中、业务时间落在**尚未回填区间内**的实时事件，仍沿用实时系统
+"基于已摄入前缀"的既有语义（见文末设计边界）。回填完成（水位线衔接）之后到达
+的新数据则完全按衔接后的水位线判定。实时运行态本身仍是纯内存组件，进程崩溃后
+的实时部分恢复不在回填重建范围内（回填重建的是历史作业对应的引擎窗口与告警
+状态）。
+
 ## 日志可解释性
 
 每个事件均打印：输入（event/tx/账户/簇/金额/币种/国家/业务时间/摄入时间/
@@ -105,7 +180,12 @@ go vet ./...            # 静态检查
 go test ./...           # 单元 + 端到端测试
 go test -race ./...     # 竞态检测（并发重复投递）
 go test -cover ./...    # 覆盖率（engine/processor >96%，rule/alert >89%）
-go run ./cmd/demo       # 交互式场景演示，末尾打印告警与计数守恒汇总
+go run ./cmd/demo                    # 实时场景演示，末尾打印告警与计数守恒汇总
+
+# 回填端到端演示（生成乱序+重复+大跨度 JSONL，逐笔比对升序参考流）：
+go run ./cmd/backfill-demo ./bf-work            # 全量回填
+go run ./cmd/backfill-demo ./bf-work --pause    # 归并途中取消，再续跑
+ls ./bf-work/backfill-state                     # 分块 JSONL 与清单（完成后自动清理）
 ```
 
 测试覆盖矩阵：
@@ -124,11 +204,26 @@ go run ./cmd/demo       # 交互式场景演示，末尾打印告警与计数守
 | 状态机单向、终态拒绝 | `TestStateMachineOneWay`、`TestManualReviewStateFlowEndToEnd` |
 | 簇合并 / 冷却桶 | `TestClusterMergesAcrossRules`、`TestCooldownBucketing` |
 | 日志含输入与判定依据 | `TestLoggingContainsInputAndBasis` |
+| 回填结论与升序参考流逐笔一致（乱序+重复+大跨度） | `backfill.TestBackfillEquivalentToAscendingReference` |
+| 回填内存有界（批远大于单块） | `backfill.TestBackfillBoundedMemoryManyChunks` |
+| 磁盘分块/清单落盘与重载 | `backfill.TestBackfillDiskStoreRoundTrip`、`backfill.TestJSONLFileReaderRoundTrip` |
+| 历史与实时 EventID 重叠只计一次 | `backfill.TestBackfillIdempotentWithLiveState`、`processor.TestHistoricalAndLiveShareIdempotence` |
+| 回填与实时并发一致 | `backfill.TestBackfillConcurrentWithLive`、`processor.TestConcurrentHistoricalAndLiveSameEvent` |
+| 历史不误标 late、水位线单调衔接 | `processor.TestHistoricalIngestionNotFlaggedLateAndSeamsWatermark`、`processor.TestWatermarkAdvancedForwardAfterNewerBackfill` |
+| 归并途中取消、多次续跑计数守恒 | `backfill.TestBackfillPauseAndResumeConservesCounts` |
+| 进程重启重放重建、终态与参考一致 | `backfill.TestBackfillRestartRebuildsProcessor` |
+| 崩溃前 ACK 不回退、计数不重 | `backfill.TestBackfillRestartPreservesAlertState`、`alert.TestSnapshotAndRestoreStatesMonotone` |
 
 ## 设计边界（诚实声明）
 
 有状态规则在"流处理进行到一半"时，若一个事件先于同窗口内其他事件被摄入，
-其即时结论可能不同（计数依赖已摄入前缀）。组件对外部承诺的一致性是
+其即时结论可能不同（计数依赖已摄入前缀）。组件对外部承诺的实时一致性是
 **EventID 级别的**：同一事件（含其任意重放）结论恒定，且同一批输入在任意
 投递顺序下，每个 EventID 的最终结论一致——通过"业务时间窗口 + 首次判定
 缓存回放"实现，而不是重写规则内部状态。
+
+**回填把这个边界对历史数据收紧到了"批次终态"**：回填在摄入前先做分块外部
+排序，使有状态规则观察到的历史前缀就是业务时间升序的完整前缀，所以回填批次
+的每笔结论都与"升序逐条处理"完全一致，而不仅是 EventID 级别一致。未被回填
+覆盖的实时区间仍遵循上面的实时语义；如上文兼容边界所述，回填进行中落在未回填
+区间内的实时事件不享受这种批次终态保证。

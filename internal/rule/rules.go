@@ -211,7 +211,12 @@ func (r *VelocityRule) Evaluate(tx domain.Transaction) (*domain.Hit, error) {
 		events = map[string]time.Time{}
 		r.account[tx.AccountID] = events
 	}
-	if prev, ok := events[tx.EventID]; !ok || tx.OccurredAt.After(prev) {
+	// Earliest-occurrence-wins for a known EventID: the merge pipeline may
+	// encounter an in-batch repeat carrying a *later* OccurredAt, but the
+	// reference semantics ("one EventID, the earliest business time") make
+	// that repeat a no-op everywhere — including this window state. This also
+	// keeps RestoreInto replays (which always arrive ascending) stable.
+	if _, seen := events[tx.EventID]; !seen {
 		events[tx.EventID] = tx.OccurredAt
 	}
 	cutoff := tx.OccurredAt.Add(-r.Window)

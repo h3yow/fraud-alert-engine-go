@@ -89,6 +89,15 @@ const (
 	StateResolved AlertState = "RESOLVED"
 )
 
+// AlertStateRecord is the portable, persistable operational state of one
+// alert, used by backfill checkpoints so that operator Ack/Resolve actions
+// survive a pause or process restart.
+type AlertStateRecord struct {
+	Key       string
+	State     AlertState
+	UpdatedAt time.Time
+}
+
 // Alert is the deduplicated/aggregated unit shown to operators.
 type Alert struct {
 	Key       string

@@ -123,3 +123,44 @@ func TestStateMachineOneWay(t *testing.T) {
 type loggingStub struct{ t *testing.T }
 
 func (loggingStub) Printf(string, ...any) {}
+
+func TestSnapshotAndRestoreStatesMonotone(t *testing.T) {
+
+	s := New(nil)
+	base := time.Date(2026, 9, 23, 10, 0, 0, 0, time.UTC)
+	hit := &domain.Hit{RuleID: "R1", Action: domain.ActionBlock}
+	tx := func(id string, at time.Time) domain.Transaction {
+		return domain.Transaction{EventID: id, AccountID: "a", OccurredAt: at}
+	}
+	a0, _ := s.Record(hit, tx("e1", base), false)
+	if a0 == nil {
+		t.Fatal("record returned no alert")
+	}
+	if a, ok := s.Ack(a0.Key, base.Add(time.Minute)); !ok || a.State != domain.StateAcked {
+		t.Fatalf("ack setup: %v %v", a, ok)
+	}
+	snap := s.SnapshotStates()
+	if len(snap) != 1 || snap[0].State != domain.StateAcked {
+		t.Fatalf("snapshot: %+v", snap)
+	}
+
+	// Restore onto an empty store: placeholder alert in ACKED state, then a
+	// replay fold must populate the hit while preserving ACKED.
+	s2 := New(nil)
+	s2.RestoreStates(snap)
+	if _, ackOK := s2.Ack(snap[0].Key, time.Now()); ackOK {
+		t.Fatal("restored ACKED alert must reject a second Ack")
+	}
+	s2.Record(hit, tx("e1", base), false)
+	a, _ := s2.Get(snap[0].Key)
+	if a.State != domain.StateAcked || a.HitCount != 1 {
+		t.Fatalf("restore+fold wrong: state=%s hits=%d", a.State, a.HitCount)
+	}
+
+	// Monotone: restoring OPEN over ACKED must not roll back.
+	s2.RestoreStates([]domain.AlertStateRecord{{Key: snap[0].Key, State: domain.StateOpen}})
+	a, _ = s2.Get(snap[0].Key)
+	if a.State != domain.StateAcked {
+		t.Fatalf("state rolled back to %s", a.State)
+	}
+}

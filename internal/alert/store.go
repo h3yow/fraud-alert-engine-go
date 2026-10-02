@@ -162,6 +162,56 @@ func (s *Store) Get(key string) (*domain.Alert, bool) {
 	return cloneAlert(a), true
 }
 
+// SnapshotStates exports only the operational lifecycle state (OPEN/ACKED/
+// RESOLVED) of every alert. It is deliberately much smaller than Snapshot:
+// backfill checkpoints must persist operator state cheaply without caching
+// the (derivable, EventID-deduplicated) hit contents.
+func (s *Store) SnapshotStates() []domain.AlertStateRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	keys := make([]string, 0, len(s.alerts))
+	for k := range s.alerts {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]domain.AlertStateRecord, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, domain.AlertStateRecord{
+			Key: k, State: s.alerts[k].State, UpdatedAt: s.alerts[k].UpdatedAt,
+		})
+	}
+	return out
+}
+
+// RestoreStates replays operational states from a checkpoint onto a freshly
+// rebuilt store. It is monotone: a stored state never moves an alert
+// backwards (OPEN->ACKED->RESOLVED ordering is respected), and alerts that
+// do not exist yet are created as minimal placeholders that subsequent
+// historical replay fills with hits, EventIDs and first/last timestamps.
+func (s *Store) RestoreStates(recs []domain.AlertStateRecord) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rank := map[domain.AlertState]int{
+		domain.StateOpen: 0, domain.StateAcked: 1, domain.StateResolved: 2,
+	}
+	for _, rec := range recs {
+		a := s.alerts[rec.Key]
+		if a == nil {
+			a = &domain.Alert{
+				Key: rec.Key, State: domain.StateOpen,
+				EventIDs: map[string]struct{}{},
+			}
+			s.alerts[rec.Key] = a
+		}
+		if rank[rec.State] > rank[a.State] {
+			a.State = rec.State
+		}
+		if rec.UpdatedAt.After(a.UpdatedAt) {
+			a.UpdatedAt = rec.UpdatedAt
+		}
+	}
+}
+
 // Snapshot returns snapshot copies of all alerts in stable key order.
 func (s *Store) Snapshot() []domain.Alert {
 	s.mu.Lock()
