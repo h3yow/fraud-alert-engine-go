@@ -98,6 +98,7 @@ func alertMap(p *processor.Processor) map[string]domain.Alert {
 // compacted backfill must equal feeding the unique events sorted by
 // business time through the normal real-time path one by one.
 func TestBackfillMatchesSequentialByBusinessTime(t *testing.T) {
+	defer func() { markCase("TestBackfillMatchesSequentialByBusinessTime", !t.Failed()) }()
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	batch := buildHistoricalBatch(base)
 	want := uniqueSorted(batch)
@@ -180,6 +181,7 @@ func TestBackfillMatchesSequentialByBusinessTime(t *testing.T) {
 // over the same session directory) and resumes. Already-applied events must
 // not be counted twice and nothing may be skipped.
 func TestBackfillStopAndResumeCountConservation(t *testing.T) {
+	defer func() { markCase("TestBackfillStopAndResumeCountConservation", !t.Failed()) }()
 	base := time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)
 	batch := buildHistoricalBatch(base)
 	want := uniqueSorted(batch)
@@ -297,6 +299,7 @@ func TestBackfillStopAndResumeCountConservation(t *testing.T) {
 // no regression of pre-existing alerts, and smooth watermark connection
 // afterwards.
 func TestBackfillConcurrentWithRealtime(t *testing.T) {
+	defer func() { markCase("TestBackfillConcurrentWithRealtime", !t.Failed()) }()
 	lg := &logging.BufferLogger{}
 	proc := newProcessor(lg)
 	now := time.Date(2026, 3, 10, 12, 0, 0, 0, time.UTC)
@@ -478,6 +481,7 @@ func TestBackfillConcurrentWithRealtime(t *testing.T) {
 // guards: submitting older-than-cursor data after progress is rejected, and
 // re-running a finished session is a no-op.
 func TestBackfillChunkedStreamingAndGuards(t *testing.T) {
+	defer func() { markCase("TestBackfillChunkedStreamingAndGuards", !t.Failed()) }()
 	base := time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)
 	batch := buildHistoricalBatch(base)
 	want := uniqueSorted(batch)

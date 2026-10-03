@@ -155,6 +155,84 @@ func main() {
 			a.Key, a.RuleID, a.AccountID, a.State, a.HitCount,
 			a.FirstSeen.Format(time.RFC3339), a.LastSeen.Format(time.RFC3339))
 	}
+
+	// 11) Interrupted backfill + restart-from-empty resume: run half of a
+	//     bursty historical batch, then throw away the whole component
+	//     (fresh registry/engine/store/processor = "new process"), resume
+	//     the same session id and show the final verdicts/counts equal the
+	//     uninterrupted reference.
+	fmt.Println("\n===== restart-from-empty resume demo =====")
+	rdir, err := os.MkdirTemp("", "backfill-restart-demo")
+	if err != nil {
+		panic(err)
+	}
+	defer os.RemoveAll(rdir)
+	newProc := func() *processor.Processor {
+		lg := logging.NewStdLogger(os.Stdout)
+		return processor.New(engine.New(rule.NewDefaultRegistry(), lg), alert.New(lg), time.Minute, lg)
+	}
+	rbase := time.Date(2026, 1, 15, 0, 0, 0, 0, time.UTC)
+	mkHist := func(id string, i int) domain.Transaction {
+		return domain.Transaction{
+			EventID: "R-" + id, TxID: "TR-" + id, AccountID: "acct-restart",
+			Amount: 10, Currency: "USD", Country: "US", EventType: "PAY",
+			OccurredAt: rbase.Add(time.Duration(i) * time.Minute), IngestedAt: time.Now(),
+		}
+	}
+	var rbatch []domain.Transaction
+	for i := 0; i < 8; i++ { // 8 events within 7 minutes: velocity breach from #4 on
+		rbatch = append(rbatch, mkHist(fmt.Sprintf("%02d", i), i))
+	}
+	rbatch = append(rbatch, rbatch[2]) // one in-batch duplicate
+
+	// Reference: uninterrupted one-shot business-time processing.
+	ref := newProc()
+	refVerdict := map[string]domain.Action{}
+	for i := 0; i < 8; i++ {
+		refVerdict[rbatch[i].EventID] = ref.Process(rbatch[i]).Action
+	}
+
+	// Phase 1: process the first 4, then "kill the process".
+	p1 := newProc()
+	s1, err := backfill.New(p1, backfill.Options{Dir: rdir, Logger: logging.NewStdLogger(os.Stdout)}).Begin("restart-demo")
+	if err != nil {
+		panic(err)
+	}
+	if err := s1.Submit(rbatch); err != nil {
+		panic(err)
+	}
+	s1.SetStopHook(func(applied int64) bool { return applied >= 4 })
+	rst1, err := s1.Run(context.Background())
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf(">>> phase1 stopped at applied=%d; component now discarded (simulated process exit)\n", rst1.Applied)
+
+	// Phase 2: brand-new empty component, same session dir, run to done.
+	p2 := newProc()
+	s2, err := backfill.New(p2, backfill.Options{Dir: rdir, Logger: logging.NewStdLogger(os.Stdout)}).Begin("restart-demo")
+	if err != nil {
+		panic(err)
+	}
+	rst2, err := s2.Run(context.Background())
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf(">>> phase2 resumed into EMPTY component: applied=%d skipped=%d done=%v\n",
+		rst2.Applied, rst2.Skipped, rst2.Done)
+	allMatch := true
+	for i := 0; i < 8; i++ {
+		id := rbatch[i].EventID
+		got, ok := p2.Verdict(id)
+		mark := "ok"
+		if !ok || got.Action != refVerdict[id] {
+			mark = "MISMATCH"
+			allMatch = false
+		}
+		fmt.Printf("    event=%s restarted=%v sequential=%v %s\n", id, got.Action, refVerdict[id], mark)
+	}
+	fmt.Printf(">>> restart resume identical to one-shot sequential: %v (alerts=%d)\n",
+		allMatch, len(p2.Alerts()))
 }
 
 func winner(v domain.Verdict) string {

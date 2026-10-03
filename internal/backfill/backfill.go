@@ -6,14 +6,26 @@
 // wide business-time range). Every chunk is sorted and spilled to disk as a
 // "run", so the whole batch never has to fit in memory. Run then replays
 // the merged runs through processor.Processor.ProcessHistorical in global
-// (OccurredAt, EventID) order, checkpointing after every applied event so
-// the session can be stopped and resumed (even across process restarts)
-// without re-counting or skipping anything.
+// (OccurredAt, EventID) order, atomically persisting the cursor together
+// with the complete processor state after every applied event, so the
+// session can be stopped and resumed — including across a process restart
+// where the component comes back EMPTY — without re-counting, skipping or
+// re-concluding anything.
+//
+// Restart semantics (Begin):
+//   - Applied progress + empty processor: the full checkpointed state
+//     (verdict cache, watermark, stateful-rule state, alerts including
+//     OPEN/ACKED/RESOLVED lifecycle) is restored first, then the cursor
+//     prefix is skipped and replay continues after it.
+//   - Applied progress + the same live processor: the prefix effects are
+//     already in memory; the cursor event must be present there or Begin
+//     refuses (a foreign non-empty processor cannot fork history).
 //
 // Consistency contract:
 //   - The final per-event verdict, hit rules, alert attribution and counts
-//     equal those of feeding the unique events, sorted by business time,
-//     through the processor one by one.
+//     equal those of feeding the unique events (one record per EventID;
+//     collisions keep the earliest-OccurredAt copy), sorted by business
+//     time, through the processor one by one.
 //   - The same EventID submitted any number of times is applied once.
 //   - Real-time traffic may keep flowing through Processor.Process while a
 //     backfill runs; the processor lock guarantees one stable verdict per
@@ -26,6 +38,7 @@ package backfill
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -62,6 +75,9 @@ type Options struct {
 	MaxOpenRuns int
 }
 
+// snapshotVersion is the on-disk format version of a backfill snapshot.
+const snapshotVersion = 2
+
 // Stats reports session progress.
 type Stats struct {
 	Submitted int64 // transactions accepted via Submit (including duplicates)
@@ -72,14 +88,21 @@ type Stats struct {
 	LastOccur time.Time
 }
 
-// checkpoint is the persisted resume cursor: every record with a sort key
-// less than or equal to (LastOccur, LastEvent) has been applied.
+// checkpoint is the persisted session state. The cursor marks every record
+// with sort key <= (LastOccur, LastEvent) as applied, and Processor carries
+// the complete component state (verdict cache, watermark, stateful-rule
+// state, alerts with their OPEN/ACKED/RESOLVED lifecycle) sampled at that
+// exact cursor. The two are persisted in one atomic file, so a process
+// restart into an empty component can restore the state and then continue
+// from the cursor with identical results to an uninterrupted run.
 type checkpoint struct {
-	LastEvent string    `json:"last_event"`
-	LastOccur time.Time `json:"last_occur"`
-	Applied   int64     `json:"applied"`
-	Submitted int64     `json:"submitted"`
-	Done      bool      `json:"done"`
+	Version   int             `json:"version"`
+	LastEvent string          `json:"last_event"`
+	LastOccur time.Time       `json:"last_occur"`
+	Applied   int64           `json:"applied"`
+	Submitted int64           `json:"submitted"`
+	Done      bool            `json:"done"`
+	Processor processor.State `json:"processor"`
 }
 
 // Backfiller runs resumable backfill sessions against a live processor.
@@ -109,11 +132,36 @@ type Session struct {
 
 	mu sync.Mutex // guards cp
 	cp checkpoint
+
+	// stopHook, when set, is consulted after every applied event; returning
+	// true stops the run exactly at that event (treated like a cancelled
+	// context). Test-only deterministic stop point.
+	stopHook func(applied int64) bool
+}
+
+// SetStopHook installs a deterministic stop point consulted after every
+// applied event: when stop returns true the run ends cleanly at that event
+// (exactly as a cancelled context would). It is intended for tests and
+// local demos that need to reproduce an interruption at an exact event;
+// production callers cancel the run context instead.
+func (s *Session) SetStopHook(stop func(applied int64) bool) {
+	s.stopHook = stop
 }
 
 // Begin creates a new session or resumes the persisted session with the
-// same id. Resuming reloads the checkpoint, so already-applied records are
-// never re-applied and unsubmitted work is never lost.
+// same id. Resume behaviour depends on the attached processor:
+//
+//   - A session with applied progress attached to an EMPTY processor (the
+//     normal "process restarted" case) has its complete state restored
+//     (verdicts, watermark, stateful-rule state and alerts, including
+//     lifecycle) before Begin returns, so the checkpointed prefix is
+//     skipped on the next Run without losing any of its effects.
+//   - Attached to a non-empty processor that already contains the cursor
+//     event (same-process continuation), nothing is restored; the live
+//     state is used. A non-empty processor that does NOT contain the
+//     cursor state makes Begin return an error rather than silently fork.
+//
+// Unsubmitted work is never lost because it lives in the on-disk run files.
 func (b *Backfiller) Begin(id string) (*Session, error) {
 	if id == "" {
 		return nil, fmt.Errorf("backfill: empty session id")
@@ -131,11 +179,42 @@ func (b *Backfiller) Begin(id string) (*Session, error) {
 		if err := json.Unmarshal(raw, &s.cp); err != nil {
 			return nil, fmt.Errorf("backfill: corrupt checkpoint: %w", err)
 		}
-		b.logger.Printf("[backfill] resume session=%s applied=%d submitted=%d done=%v cursor=(%s,%s)",
-			id, s.cp.Applied, s.cp.Submitted, s.cp.Done, s.cp.LastOccur.Format(time.RFC3339Nano), s.cp.LastEvent)
+		if s.cp.Version != snapshotVersion {
+			return nil, fmt.Errorf("backfill: session %s checkpoint version %d unsupported (want %d); "+
+				"cannot guarantee state restoration", id, s.cp.Version, snapshotVersion)
+		}
+		switch {
+		case s.cp.Applied > 0 && b.proc.IsEmpty():
+			// Real restart: the process came back with an empty component.
+			// Restore verdict cache, watermark, stateful-rule state and
+			// alerts to the exact checkpoint cursor before continuing, so
+			// the skipped prefix is not lost.
+			if err := b.proc.RestoreState(s.cp.Processor); err != nil {
+				return nil, fmt.Errorf("backfill: restore session %s: %w", id, err)
+			}
+			b.logger.Printf("[backfill] restart session=%s restored_state=true verdicts=%d alerts=%d applied=%d done=%v cursor=(%s,%s)",
+				id, len(s.cp.Processor.Verdicts), len(s.cp.Processor.Alerts.Alerts),
+				s.cp.Applied, s.cp.Done, s.cp.LastOccur.Format(time.RFC3339Nano), s.cp.LastEvent)
+		case s.cp.Applied > 0:
+			// Same-process continuation (e.g. ctx cancellation without a
+			// process restart): the live component already holds every
+			// effect of the checkpointed prefix. Verify it really does
+			// before trusting the cursor, so a foreign/non-empty processor
+			// can never silently fork history.
+			if _, ok := b.proc.Verdict(s.cp.LastEvent); !ok {
+				return nil, fmt.Errorf("backfill: session %s has applied progress to (%s,%s) but the "+
+					"attached processor does not contain that state; attach the matching processor or start empty",
+					id, s.cp.LastOccur.Format(time.RFC3339Nano), s.cp.LastEvent)
+			}
+			b.logger.Printf("[backfill] resume session=%s restored_state=false live_state_matches=true applied=%d done=%v cursor=(%s,%s)",
+				id, s.cp.Applied, s.cp.Done, s.cp.LastOccur.Format(time.RFC3339Nano), s.cp.LastEvent)
+		default:
+			b.logger.Printf("[backfill] resume session=%s no_applied_progress submitted=%d", id, s.cp.Submitted)
+		}
 	} else if !os.IsNotExist(err) {
 		return nil, err
 	} else {
+		s.cp.Version = snapshotVersion
 		b.logger.Printf("[backfill] begin session=%s dir=%s", id, dir)
 	}
 	return s, nil
@@ -168,19 +247,23 @@ func (s *Session) Submit(chunk []domain.Transaction) error {
 	}
 	path, err := s.nextRunPath()
 	if err != nil {
+		s.mu.Unlock()
 		return err
 	}
 	w, err := newRunWriter(path)
 	if err != nil {
+		s.mu.Unlock()
 		return err
 	}
 	for _, tx := range sorted {
 		if err := w.write(tx); err != nil {
 			w.close()
+			s.mu.Unlock()
 			return err
 		}
 	}
 	if err := w.close(); err != nil {
+		s.mu.Unlock()
 		return err
 	}
 	s.cp.Submitted += int64(len(chunk))
@@ -197,10 +280,12 @@ func (s *Session) Submit(chunk []domain.Transaction) error {
 }
 
 // Run applies all submitted-but-unapplied transactions to the processor in
-// global (OccurredAt, EventID) order. It checkpoints after every applied
-// event; cancelling ctx (or a process restart) simply stops the run, and a
-// later Run on a session with the same id resumes exactly after the last
-// checkpointed record — nothing is re-counted and nothing is missed.
+// global (OccurredAt, EventID) order. After every applied event it
+// atomically persists the cursor PLUS the complete processor state;
+// cancelling ctx (or SetStopHook, or a process hard-stop) simply ends the
+// run. A later Run with the same id resumes exactly after the last
+// checkpointed record — on an empty component Begin first restores the
+// checkpointed state — so nothing is re-counted and nothing is missed.
 func (s *Session) Run(ctx context.Context) (Stats, error) {
 	runs, err := s.runFiles()
 	if err != nil {
@@ -223,7 +308,10 @@ func (s *Session) Run(ctx context.Context) (Stats, error) {
 	var skipped int64
 	emit := func(tx domain.Transaction) error {
 		if hasCursor && !lessKey(cursor, keyOf(tx)) {
-			// Already applied before the stop: skip without re-counting.
+			// At or before the checkpoint cursor. On a restarted-empty
+			// component these effects were already restored as state; on an
+			// in-process resume they are still live. Either way skip
+			// without re-evaluating or re-counting.
 			skipped++
 			return nil
 		}
@@ -243,12 +331,15 @@ func (s *Session) Run(ctx context.Context) (Stats, error) {
 		}
 		s.b.logger.Printf("[backfill] apply session=%s event=%s tx=%s occurred=%s verdict=%s alert=%s applied=%d",
 			s.id, tx.EventID, tx.TxID, tx.OccurredAt.Format(time.RFC3339Nano), v.Action, v.AlertKey, applied)
+		if s.stopHook != nil && s.stopHook(applied) {
+			return context.Canceled
+		}
 		return nil
 	}
 	dups, err := mergeRuns(runs, emit)
 	skipped += dups
 	if err != nil {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
 			cur := s.statsWithSkipped(skipped)
 			s.b.logger.Printf("[backfill] stopped session=%s applied=%d skipped=%d resume_cursor=(%s,%s)",
 				s.id, cur.Applied, skipped, cur.LastOccur.Format(time.RFC3339Nano), cur.LastEvent)
@@ -293,10 +384,19 @@ func (s *Session) checkpointPath() string {
 	return filepath.Join(s.dir, "checkpoint.json")
 }
 
-// saveCheckpointLocked persists the cursor atomically (tmp file + rename)
-// so a crash can never leave a torn checkpoint behind. The caller must
-// hold s.mu.
+// saveCheckpointLocked persists the cursor together with the complete
+// processor state, atomically (tmp file + rename), so a crash can never
+// leave a torn checkpoint or a cursor without the state it refers to. The
+// caller must hold s.mu. SnapshotState takes the processor lock (which may
+// take rule/alert locks) while s.mu is held; no code path ever takes s.mu
+// while holding the processor lock, so the ordering cannot deadlock.
 func (s *Session) saveCheckpointLocked() error {
+	st, err := s.b.proc.SnapshotState()
+	if err != nil {
+		return err
+	}
+	s.cp.Version = snapshotVersion
+	s.cp.Processor = st
 	raw, err := json.Marshal(s.cp)
 	if err != nil {
 		return err

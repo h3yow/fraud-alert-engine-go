@@ -29,9 +29,12 @@ func lessKey(a, b sortKey) bool {
 	return a.eventID < b.eventID
 }
 
-// sortAndDedupe sorts one in-memory chunk by sortKey and drops adjacent
-// exact duplicates (same EventID and same OccurredAt), returning the number
-// of dropped duplicates.
+// sortAndDedupe sorts one in-memory chunk by sortKey and keeps exactly one
+// record per EventID: the copy with the earliest OccurredAt (EventID is the
+// stable tie-break). This matches the canonical replay stream used by the
+// one-shot sequential reference ("dedupe by EventID, then replay in business
+// time"), so a transaction carrying the same identity twice (even with
+// conflicting timestamps) can only ever be applied once.
 func sortAndDedupe(chunk []domain.Transaction) ([]domain.Transaction, int) {
 	sorted := append([]domain.Transaction(nil), chunk...)
 	sort.SliceStable(sorted, func(i, j int) bool {
@@ -40,7 +43,7 @@ func sortAndDedupe(chunk []domain.Transaction) ([]domain.Transaction, int) {
 	out := sorted[:0]
 	dups := 0
 	for i, tx := range sorted {
-		if i > 0 && tx.EventID == sorted[i-1].EventID && tx.OccurredAt.Equal(sorted[i-1].OccurredAt) {
+		if i > 0 && tx.EventID == sorted[i-1].EventID {
 			dups++
 			continue
 		}
@@ -182,9 +185,9 @@ func (h *mergeHeap) down(i int) {
 
 // mergeRuns streams the k-way merge of the sorted run files at paths,
 // invoking emit for every record in global (OccurredAt, EventID) order.
-// Adjacent exact duplicates (same EventID and OccurredAt appearing in more
-// than one run) are emitted only once; dups counts the suppressed copies.
-// Memory usage is bounded by one record per open run file.
+// Each EventID is emitted exactly once (the earliest-business-time copy
+// wins); dups counts the suppressed copies. Memory usage is bounded by one
+// record per open run file plus the emitted-id set.
 func mergeRuns(paths []string, emit func(tx domain.Transaction) error) (dups int64, err error) {
 	readers := make([]*runReader, 0, len(paths))
 	defer func() {
@@ -207,18 +210,17 @@ func mergeRuns(paths []string, emit func(tx domain.Transaction) error) (dups int
 			h.push(mergeItem{tx: tx, run: i})
 		}
 	}
-	var prev *sortKey
+	emitted := map[string]struct{}{}
 	for h.len() > 0 {
 		it := h.pop()
 		k := keyOf(it.tx)
-		if prev != nil && prev.eventID == k.eventID && prev.occurred.Equal(k.occurred) {
+		if _, seen := emitted[k.eventID]; seen {
 			dups++
 		} else {
 			if err := emit(it.tx); err != nil {
 				return dups, err
 			}
-			kc := k
-			prev = &kc
+			emitted[k.eventID] = struct{}{}
 		}
 		tx, ok, err := readers[it.run].next()
 		if err != nil {
