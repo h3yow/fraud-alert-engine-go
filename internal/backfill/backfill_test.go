@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"math/rand"
 	"sort"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -255,8 +257,8 @@ func TestBackfillStopAndResumeCountConservation(t *testing.T) {
 	if st2.Applied != int64(len(want)) {
 		t.Fatalf("count not conserved: applied=%d unique=%d", st2.Applied, len(want))
 	}
-	t.Logf("scenario=stop_resume phase2=resumed applied_total=%d skipped_already_applied=%d",
-		st2.Applied, st2.Skipped)
+	t.Logf("scenario=stop_resume phase2=resumed applied_total=%d prefix_replayed=%d merge_dups=%d",
+		st2.Applied, st2.Rebuilt, st2.Skipped)
 
 	// Final state must equal the uninterrupted sequential reference.
 	refProc := newProcessor(&logging.BufferLogger{})
@@ -288,6 +290,419 @@ func TestBackfillStopAndResumeCountConservation(t *testing.T) {
 	}
 	t.Logf("scenario=stop_resume result=PASS applied=%d alerts=%d count_conserved=true no_recount=true no_miss=true",
 		st2.Applied, len(gotAlerts))
+}
+
+// TestBackfillRestartEmptyStateMatchesSequential covers the production
+// incident path: a backfill run is stopped mid-way, then the PROCESS itself
+// restarts — every in-memory component (velocity windows, alert EventID
+// sets/counts/FirstSeen/LastSeen, verdict cache, watermark) starts EMPTY —
+// and the same session directory is resumed against that fresh processor.
+//
+// It asserts the resumed final state is identical, per-event and per-alert,
+// to feeding the de-duplicated batch through one uninterrupted run in
+// business-time order: verdicts/actions, winning rules, alert attribution
+// (dedup keys), counts, first/last seen and reasons.
+func TestBackfillRestartEmptyStateMatchesSequential(t *testing.T) {
+	for _, stopAfter := range []int{1, 7, 31, 64, 128} {
+		name := fmt.Sprintf("stop_after_%d", stopAfter)
+		t.Run(name, func(t *testing.T) {
+			base := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
+			batch := buildHistoricalBatch(base)
+			want := uniqueSorted(batch)
+			if stopAfter >= len(want) {
+				t.Skipf("batch only has %d unique events", len(want))
+			}
+			dir := t.TempDir()
+			t.Logf("scenario=restart_empty unique=%d stop_after=%d plan=stop_then_fresh_processor_resume",
+				len(want), stopAfter)
+
+			// Phase 1: submit chunks and run until at least stopAfter events
+			// have been applied, then "kill the process" by dropping the
+			// processor/session/backfiller entirely. Only dir survives.
+			// (The cancellation watcher is coarse, so the run may apply a
+			// few extra; the exact cursor is immaterial to equivalence.)
+			lg1 := &logging.BufferLogger{}
+			proc1 := newProcessor(lg1)
+			sess1, err := New(proc1, Options{Dir: dir, Logger: lg1, MaxOpenRuns: 6}).Begin("crash-job")
+			if err != nil {
+				t.Fatal(err)
+			}
+			const chunks = 9
+			for i := 0; i < len(batch); i += (len(batch) + chunks - 1) / chunks {
+				end := i + (len(batch)+chunks-1)/chunks
+				if end > len(batch) {
+					end = len(batch)
+				}
+				if err := sess1.Submit(batch[i:end]); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			go func() {
+				for {
+					if sess1.Progress().Applied >= int64(stopAfter) {
+						cancel()
+						return
+					}
+					time.Sleep(time.Millisecond)
+				}
+			}()
+			st1, err := sess1.Run(ctx)
+			if err != nil {
+				t.Fatalf("phase-1 run: %v", err)
+			}
+			if st1.Done {
+				t.Fatalf("phase 1 should have stopped near %d, got %+v", stopAfter, st1)
+			}
+			if st1.Applied < int64(stopAfter) || st1.Applied >= int64(len(want)) {
+				t.Fatalf("phase 1 applied=%d out of range [%d,%d): %+v",
+					st1.Applied, stopAfter, len(want), st1)
+			}
+			stoppedAt := st1.Applied
+			t.Logf("scenario=restart_empty phase1=killed applied=%d cursor=(%s,%s)",
+				stoppedAt, st1.LastOccur.Format(time.RFC3339Nano), st1.LastEvent)
+
+			// Phase 2: PROCESS RESTART. A genuinely empty processor (fresh
+			// engine/registry/velocity state, fresh alert store, fresh seen
+			// cache), a fresh Backfiller, reusing the on-disk session.
+			lg2 := &logging.BufferLogger{}
+			proc2 := newProcessor(lg2)
+			if len(proc2.Alerts()) != 0 {
+				t.Fatal("fresh processor must start with zero alerts")
+			}
+			sess2, err := New(proc2, Options{Dir: dir, Logger: lg2, MaxOpenRuns: 6}).Begin("crash-job")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if p := sess2.Progress(); p.Applied != stoppedAt {
+				t.Fatalf("checkpoint not recovered after restart: %+v", p)
+			}
+			st2, err := sess2.Run(context.Background())
+			if err != nil {
+				t.Fatalf("phase-2 run: %v", err)
+			}
+			if !st2.Done {
+				t.Fatalf("phase 2 must finish, got %+v", st2)
+			}
+			// Applied counts genuinely new applications only; the rebuilt
+			// prefix is reported separately and must not inflate it.
+			if st2.Applied != int64(len(want)) {
+				t.Fatalf("applied=%d want %d (rebuilt must not recount): %+v",
+					st2.Applied, len(want), st2)
+			}
+			if st2.Rebuilt != stoppedAt {
+				t.Fatalf("rebuilt=%d want %d (whole applied prefix replays once)",
+					st2.Rebuilt, stoppedAt)
+			}
+			t.Logf("scenario=restart_empty phase2=resumed_on_empty applied=%d rebuilt=%d dup=%d",
+				st2.Applied, st2.Rebuilt, st2.Skipped)
+
+			// Reference: one uninterrupted business-time-ordered run.
+			refProc := newProcessor(&logging.BufferLogger{})
+			refVerdicts := map[string]domain.Verdict{}
+			for _, tx := range want {
+				refVerdicts[tx.EventID] = refProc.Process(tx)
+			}
+
+			// Per-event equivalence: action, late flag, winning rule,
+			// attributed alert key and the full hit list.
+			for _, tx := range want {
+				got, ok := proc2.Verdict(tx.EventID)
+				if !ok {
+					t.Fatalf("event %s missing after resume", tx.EventID)
+				}
+				ref := refVerdicts[tx.EventID]
+				if got.Action != ref.Action || got.IsLate != ref.IsLate ||
+					got.AlertKey != ref.AlertKey ||
+					(got.WinningHit == nil) != (ref.WinningHit == nil) ||
+					(got.WinningHit != nil && got.WinningHit.RuleID != ref.WinningHit.RuleID) ||
+					len(got.Hits) != len(ref.Hits) {
+					t.Fatalf("event %s verdict mismatch:\nresume=%+v\nsequential=%+v",
+						tx.EventID, got, ref)
+				}
+				for i := range got.Hits {
+					if got.Hits[i].RuleID != ref.Hits[i].RuleID ||
+						got.Hits[i].Action != ref.Hits[i].Action {
+						t.Fatalf("event %s hit[%d] mismatch: resume=%+v sequential=%+v",
+							tx.EventID, i, got.Hits[i], ref.Hits[i])
+					}
+				}
+			}
+
+			// Per-alert equivalence: set of keys, counts, first/last seen,
+			// state and reasons.
+			gotAlerts, refAlerts := alertMap(proc2), alertMap(refProc)
+			if len(gotAlerts) != len(refAlerts) {
+				t.Fatalf("alert count mismatch: resume=%d sequential=%d",
+					len(gotAlerts), len(refAlerts))
+			}
+			totalHits := 0
+			for key, ref := range refAlerts {
+				got, ok := gotAlerts[key]
+				if !ok {
+					t.Fatalf("alert %s missing after resume", key)
+				}
+				if got.HitCount != ref.HitCount ||
+					len(got.EventIDs) != len(ref.EventIDs) ||
+					!got.FirstSeen.Equal(ref.FirstSeen) ||
+					!got.LastSeen.Equal(ref.LastSeen) ||
+					got.State != ref.State ||
+					fmt.Sprint(got.Reasons) != fmt.Sprint(ref.Reasons) {
+					t.Fatalf("alert %s mismatch:\nresume=%+v\nsequential=%+v", key, got, ref)
+				}
+				totalHits += got.HitCount
+			}
+
+			// Watermark must end at the latest historical business time, so
+			// subsequent real-time late/out-of-order judgement connects.
+			fresh := proc2.Process(mkTx("rt-fresh", "acct-norm", "US", 5,
+				want[len(want)-1].OccurredAt.Add(time.Minute)))
+			if fresh.IsLate {
+				t.Fatal("current real-time event must not be flagged late after resumed backfill")
+			}
+			straggler := proc2.Process(mkTx("rt-straggler", "acct-norm", "US", 5,
+				want[0].OccurredAt.Add(-48*time.Hour)))
+			if !straggler.IsLate {
+				t.Fatal("old real-time straggler must be flagged late after resumed backfill")
+			}
+
+			t.Logf("scenario=restart_empty result=PASS stop_after=%d actual_stop=%d alerts=%d total_hits=%d verdicts=%d identical_to_sequential=true watermark_connected=true",
+				stopAfter, stoppedAt, len(gotAlerts), totalHits, len(want))
+		})
+	}
+}
+
+// TestBackfillMultipleRestartsIdempotent stops and restarts (each time with
+// a fresh empty processor) several times, including a stop while rebuilding
+// the prefix, and a re-run after completion. Final state must still equal
+// the one-pass reference, and replays must never double any count.
+func TestBackfillMultipleRestartsIdempotent(t *testing.T) {
+	base := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	batch := buildHistoricalBatch(base)
+	want := uniqueSorted(batch)
+	dir := t.TempDir()
+	t.Logf("scenario=multi_restart unique=%d stops=3 plan=empty_state_each_time", len(want))
+
+	stops := []int{len(want) / 5, len(want) * 2 / 5, len(want) * 4 / 5}
+	prevApplied := int64(0)
+	for phase, stopAfter := range stops {
+		lg := &logging.BufferLogger{}
+		proc := newProcessor(lg)
+		sess, err := New(proc, Options{Dir: dir, Logger: lg, MaxOpenRuns: 6}).Begin("multi")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if phase == 0 {
+			if err := sess.Submit(batch); err != nil {
+				t.Fatal(err)
+			}
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			for {
+				if sess.Progress().Applied >= int64(stopAfter) {
+					cancel()
+					return
+				}
+				time.Sleep(time.Millisecond)
+			}
+		}()
+		st, err := sess.Run(ctx)
+		if err != nil {
+			t.Fatalf("phase %d run: %v", phase, err)
+		}
+		if st.Applied < int64(stopAfter) || st.Applied >= int64(len(want)) ||
+			st.Applied <= prevApplied {
+			t.Fatalf("phase %d applied=%d out of range (%d,%d) prev=%d",
+				phase, st.Applied, stopAfter, len(want), prevApplied)
+		}
+		prevApplied = st.Applied
+		t.Logf("scenario=multi_restart phase=%d killed applied=%d rebuilt=%d",
+			phase, st.Applied, st.Rebuilt)
+	}
+
+	// Final restart on an empty processor completes the job.
+	lg := &logging.BufferLogger{}
+	proc := newProcessor(lg)
+	sess, err := New(proc, Options{Dir: dir, Logger: lg, MaxOpenRuns: 6}).Begin("multi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := sess.Run(context.Background())
+	if err != nil {
+		t.Fatalf("final run: %v", err)
+	}
+	if !st.Done || st.Applied != int64(len(want)) {
+		t.Fatalf("final stats wrong: %+v want applied=%d", st, len(want))
+	}
+	t.Logf("scenario=multi_restart final applied=%d rebuilt=%d dup=%d", st.Applied, st.Rebuilt, st.Skipped)
+
+	// A completed session re-run on yet another empty processor rebuilds
+	// everything but applies nothing new.
+	procEmpty := newProcessor(&logging.BufferLogger{})
+	sessR, err := New(procEmpty, Options{Dir: dir, Logger: lg, MaxOpenRuns: 6}).Begin("multi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stR, err := sessR.Run(context.Background())
+	if err != nil {
+		t.Fatalf("post-completion run: %v", err)
+	}
+	if !stR.Done || stR.Applied != int64(len(want)) || stR.Rebuilt != int64(len(want)) {
+		t.Fatalf("post-completion rebuild wrong: %+v", stR)
+	}
+
+	refProc := newProcessor(&logging.BufferLogger{})
+	for _, tx := range want {
+		refProc.Process(tx)
+	}
+	gotAlerts, refAlerts := alertMap(proc), alertMap(refProc)
+	if len(gotAlerts) != len(refAlerts) {
+		t.Fatalf("alert count mismatch: %d vs %d", len(gotAlerts), len(refAlerts))
+	}
+	for key, ref := range refAlerts {
+		got := gotAlerts[key]
+		if got.HitCount != ref.HitCount || !got.FirstSeen.Equal(ref.FirstSeen) ||
+			!got.LastSeen.Equal(ref.LastSeen) {
+			t.Fatalf("alert %s mismatch across multiple restarts: got %+v want %+v", key, got, ref)
+		}
+	}
+	for _, tx := range want {
+		got, ok := proc.Verdict(tx.EventID)
+		if !ok {
+			t.Fatalf("event %s missing", tx.EventID)
+		}
+		ref, _ := refProc.Verdict(tx.EventID)
+		if got.Action != ref.Action || got.AlertKey != ref.AlertKey {
+			t.Fatalf("event %s mismatch: got %s/%s want %s/%s",
+				tx.EventID, got.Action, got.AlertKey, ref.Action, ref.AlertKey)
+		}
+	}
+	t.Logf("scenario=multi_restart result=PASS restarts=%d alerts=%d applied=%d identical_to_sequential=true",
+		len(stops), len(gotAlerts), st.Applied)
+}
+
+// TestBackfillCancelDuringRebuildConverges stops a resumed run on an empty
+// processor *while it is still replaying the applied prefix* (i.e. before it
+// reaches the cursor). The cursor must not move, and yet another restart
+// must still converge to the one-pass reference.
+func TestBackfillCancelDuringRebuildConverges(t *testing.T) {
+	base := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	batch := buildHistoricalBatch(base)
+	want := uniqueSorted(batch)
+	dir := t.TempDir()
+	firstStop := len(want) / 2
+	t.Logf("scenario=cancel_in_rebuild unique=%d first_stop=%d", len(want), firstStop)
+
+	// Phase 1: apply roughly half on a processor we then discard.
+	lg := &logging.BufferLogger{}
+	proc1 := newProcessor(lg)
+	sess1, err := New(proc1, Options{Dir: dir, Logger: lg, MaxOpenRuns: 6}).Begin("rebuildcancel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sess1.Submit(batch); err != nil {
+		t.Fatal(err)
+	}
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	go func() {
+		for {
+			if sess1.Progress().Applied >= int64(firstStop) {
+				cancel1()
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+	st1, err := sess1.Run(ctx1)
+	if err != nil || st1.Done {
+		t.Fatalf("phase 1: err=%v stats=%+v", err, st1)
+	}
+	appliedAtStop := st1.Applied
+	t.Logf("scenario=cancel_in_rebuild phase1 applied=%d", appliedAtStop)
+
+	// Phase 2: fresh empty processor; cancel after only a few prefix records
+	// have replayed (well short of the cursor). A counting logger fires once
+	// it has observed `after` rebuild lines, making the cancellation
+	// deterministic. The cursor must be unchanged because replay never
+	// checkpoints.
+	rebuildSeen := make(chan struct{}, 1)
+	clog := &countingLogger{after: 3, onRebuild: func() {
+		select {
+		case rebuildSeen <- struct{}{}:
+		default:
+		}
+	}}
+	proc2 := newProcessor(&logging.BufferLogger{})
+	sess2, err := New(proc2, Options{Dir: dir, Logger: clog, MaxOpenRuns: 6}).Begin("rebuildcancel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	go func() {
+		<-rebuildSeen
+		cancel2()
+	}()
+	st2, err := sess2.Run(ctx2)
+	if err != nil {
+		t.Fatalf("phase 2 run: %v", err)
+	}
+	if st2.Done {
+		t.Fatalf("phase 2 should have been interrupted during rebuild: %+v", st2)
+	}
+	if st2.Rebuilt <= 0 || st2.Rebuilt >= appliedAtStop {
+		t.Fatalf("expected to stop mid-rebuild, got rebuilt=%d cursor=%d",
+			st2.Rebuilt, appliedAtStop)
+	}
+	if st2.Applied != appliedAtStop {
+		t.Fatalf("cursor moved during rebuild: %d -> %d", appliedAtStop, st2.Applied)
+	}
+	t.Logf("scenario=cancel_in_rebuild phase2 interrupted cursor_unchanged=%d rebuilt=%d",
+		st2.Applied, st2.Rebuilt)
+
+	// Phase 3: yet another fresh empty processor runs to completion and must
+	// match the one-pass reference exactly.
+	proc3 := newProcessor(&logging.BufferLogger{})
+	sess3, err := New(proc3, Options{Dir: dir, Logger: &logging.BufferLogger{}, MaxOpenRuns: 6}).Begin("rebuildcancel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st3, err := sess3.Run(context.Background())
+	if err != nil || !st3.Done {
+		t.Fatalf("phase 3: err=%v stats=%+v", err, st3)
+	}
+	if st3.Applied != int64(len(want)) || st3.Rebuilt != appliedAtStop {
+		t.Fatalf("phase 3 stats wrong: %+v", st3)
+	}
+
+	refProc := newProcessor(&logging.BufferLogger{})
+	for _, tx := range want {
+		refProc.Process(tx)
+	}
+	gotAlerts, refAlerts := alertMap(proc3), alertMap(refProc)
+	if len(gotAlerts) != len(refAlerts) {
+		t.Fatalf("alert count mismatch: %d vs %d", len(gotAlerts), len(refAlerts))
+	}
+	for key, ref := range refAlerts {
+		got := gotAlerts[key]
+		if got.HitCount != ref.HitCount || !got.FirstSeen.Equal(ref.FirstSeen) ||
+			!got.LastSeen.Equal(ref.LastSeen) {
+			t.Fatalf("alert %s mismatch: got %+v want %+v", key, got, ref)
+		}
+	}
+	for _, tx := range want {
+		got, ok := proc3.Verdict(tx.EventID)
+		if !ok {
+			t.Fatalf("event %s missing", tx.EventID)
+		}
+		ref, _ := refProc.Verdict(tx.EventID)
+		if got.Action != ref.Action || got.AlertKey != ref.AlertKey {
+			t.Fatalf("event %s mismatch: %s/%s vs %s/%s",
+				tx.EventID, got.Action, got.AlertKey, ref.Action, ref.AlertKey)
+		}
+	}
+	t.Logf("scenario=cancel_in_rebuild result=PASS applied=%d rebuilt=%d alerts=%d identical_to_sequential=true",
+		st3.Applied, st3.Rebuilt, len(gotAlerts))
 }
 
 // TestBackfillConcurrentWithRealtime runs a historical backfill while
@@ -567,4 +982,35 @@ func TestBackfillChunkedStreamingAndGuards(t *testing.T) {
 	}
 	t.Logf("scenario=chunked_streaming result=PASS applied=%d chunks=%d compaction_exercised=true guards_ok=true",
 		st3.Applied, nChunks)
+}
+
+// countingLogger implements Logger and invokes onRebuild once after `after`
+// "[backfill] rebuild" lines have been observed. It is used to stop a resumed
+// run deterministically while it is still replaying the applied prefix.
+const countingRebuildPrefix = "[backfill] rebuild"
+
+type countingLogger struct {
+	after     int
+	onRebuild func()
+
+	mu    sync.Mutex
+	n     int
+	fired bool
+}
+
+func (c *countingLogger) Printf(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	if !strings.HasPrefix(msg, countingRebuildPrefix) {
+		return
+	}
+	c.mu.Lock()
+	c.n++
+	fire := c.n >= c.after && !c.fired
+	if fire {
+		c.fired = true
+	}
+	c.mu.Unlock()
+	if fire && c.onRebuild != nil {
+		c.onRebuild()
+	}
 }

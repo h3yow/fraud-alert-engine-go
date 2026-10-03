@@ -65,8 +65,14 @@ type Options struct {
 // Stats reports session progress.
 type Stats struct {
 	Submitted int64 // transactions accepted via Submit (including duplicates)
-	Applied   int64 // unique transactions applied to the processor
-	Skipped   int64 // merged records skipped (already applied per checkpoint, or in-batch duplicates)
+	Applied   int64 // unique transactions applied to the processor (persisted)
+	// Rebuilt counts already-applied records replayed during this Run to
+	// reconstruct in-memory rule/alert state after a fresh (empty-state)
+	// restart. They are not re-applied: the cursor does not move and Applied
+	// does not grow for them; replay is idempotent, so counts and verdicts
+	// are never doubled.
+	Rebuilt   int64
+	Skipped   int64 // exact duplicate copies suppressed by the run merge (never presented to the processor)
 	Done      bool  // true once every submitted record has been applied
 	LastEvent string
 	LastOccur time.Time
@@ -201,6 +207,17 @@ func (s *Session) Submit(chunk []domain.Transaction) error {
 // event; cancelling ctx (or a process restart) simply stops the run, and a
 // later Run on a session with the same id resumes exactly after the last
 // checkpointed record — nothing is re-counted and nothing is missed.
+//
+// Restart correctness: after a process restart the processor starts empty,
+// so before resuming past the cursor Run first *replays* the already-applied
+// prefix (records up to and including the cursor) through
+// ProcessHistorical in business-time order. This rebuilds the in-memory
+// state of stateful rules (velocity windows), alert aggregation (EventID
+// sets, counts, FirstSeen/LastSeen), the verdict cache and the watermark.
+// The replay neither advances the cursor nor increments Applied, and on a
+// warm processor every replayed record is absorbed by the idempotency
+// cache; hence a resumed run ends in exactly the state of one uninterrupted
+// business-time-ordered run.
 func (s *Session) Run(ctx context.Context) (Stats, error) {
 	runs, err := s.runFiles()
 	if err != nil {
@@ -220,15 +237,22 @@ func (s *Session) Run(ctx context.Context) (Stats, error) {
 	cursor := sortKey{occurred: s.cp.LastOccur, eventID: s.cp.LastEvent}
 	hasCursor := s.cp.Applied > 0
 	s.mu.Unlock()
-	var skipped int64
+	var rebuilt, dups int64
 	emit := func(tx domain.Transaction) error {
-		if hasCursor && !lessKey(cursor, keyOf(tx)) {
-			// Already applied before the stop: skip without re-counting.
-			skipped++
-			return nil
-		}
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if hasCursor && !lessKey(cursor, keyOf(tx)) {
+			// Rebuild: replay the prefix applied before the stop/restart so
+			// an empty processor recovers the exact business-time-ordered
+			// state. No checkpoint move, no Applied increment; idempotent on
+			// a warm processor (seen cache absorbs the record), so nothing is
+			// ever counted twice.
+			v := s.b.proc.ProcessHistorical(tx)
+			rebuilt++
+			s.b.logger.Printf("[backfill] rebuild session=%s event=%s occurred=%s verdict=%s alert=%s rebuilt=%d",
+				s.id, tx.EventID, tx.OccurredAt.Format(time.RFC3339Nano), v.Action, v.AlertKey, rebuilt)
+			return nil
 		}
 		v := s.b.proc.ProcessHistorical(tx)
 		s.mu.Lock()
@@ -245,42 +269,44 @@ func (s *Session) Run(ctx context.Context) (Stats, error) {
 			s.id, tx.EventID, tx.TxID, tx.OccurredAt.Format(time.RFC3339Nano), v.Action, v.AlertKey, applied)
 		return nil
 	}
-	dups, err := mergeRuns(runs, emit)
-	skipped += dups
+	dups, err = mergeRuns(runs, emit)
 	if err != nil {
 		if ctx.Err() != nil {
-			cur := s.statsWithSkipped(skipped)
-			s.b.logger.Printf("[backfill] stopped session=%s applied=%d skipped=%d resume_cursor=(%s,%s)",
-				s.id, cur.Applied, skipped, cur.LastOccur.Format(time.RFC3339Nano), cur.LastEvent)
+			cur := s.statsWithExtra(rebuilt, dups)
+			s.b.logger.Printf("[backfill] stopped session=%s applied=%d rebuilt=%d dup=%d resume_cursor=(%s,%s)",
+				s.id, cur.Applied, rebuilt, dups, cur.LastOccur.Format(time.RFC3339Nano), cur.LastEvent)
 			return cur, nil
 		}
-		return s.statsWithSkipped(skipped), err
+		return s.statsWithExtra(rebuilt, dups), err
 	}
 	s.mu.Lock()
 	s.cp.Done = true
 	err = s.saveCheckpointLocked()
 	s.mu.Unlock()
 	if err != nil {
-		return s.statsWithSkipped(skipped), err
+		return s.statsWithExtra(rebuilt, dups), err
 	}
-	final := s.statsWithSkipped(skipped)
-	s.b.logger.Printf("[backfill] done session=%s applied=%d skipped=%d submitted=%d",
-		s.id, final.Applied, skipped, final.Submitted)
+	final := s.statsWithExtra(rebuilt, dups)
+	s.b.logger.Printf("[backfill] done session=%s applied=%d rebuilt=%d dup=%d submitted=%d",
+		s.id, final.Applied, rebuilt, dups, final.Submitted)
 	return final, nil
 }
 
 // Progress reports the persisted progress of the session.
 func (s *Session) Progress() Stats { return s.stats() }
 
-func (s *Session) stats() Stats { return s.statsWithSkipped(0) }
+func (s *Session) stats() Stats { return s.statsWithExtra(0, 0) }
 
-func (s *Session) statsWithSkipped(skipped int64) Stats {
+// statsWithExtra attaches this Run's transient counters (rebuilt prefix
+// records, merge-suppressed duplicates) to the persisted progress.
+func (s *Session) statsWithExtra(rebuilt, dups int64) Stats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return Stats{
 		Submitted: s.cp.Submitted,
 		Applied:   s.cp.Applied,
-		Skipped:   skipped,
+		Rebuilt:   rebuilt,
+		Skipped:   dups,
 		Done:      s.cp.Done,
 		LastEvent: s.cp.LastEvent,
 		LastOccur: s.cp.LastOccur,

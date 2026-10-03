@@ -149,6 +149,38 @@ func main() {
 	fmt.Printf(">>> backfill run #2 (resume after completion): applied=%d done=%v (no re-count)\n",
 		st2.Applied, st2.Done)
 
+	// 11) Restart semantics: simulate a fresh process — a brand-new processor
+	//     built from empty state, reusing the on-disk backfill session. Run
+	//     replays the already-applied prefix to rebuild velocity/alert state
+	//     (reported as rebuilt), applies nothing new, and the final alerts are
+	//     identical to an uninterrupted run.
+	freshReg := rule.NewDefaultRegistry()
+	freshEng := engine.New(freshReg, logger)
+	freshStore := alert.New(logger)
+	p2 := processor.New(freshEng, freshStore, 30*time.Second, logger)
+	sessRestart, err := backfill.New(p2, backfill.Options{Dir: dir, Logger: logger}).Begin("demo-history")
+	if err != nil {
+		panic(err)
+	}
+	st3, err := sessRestart.Run(context.Background())
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf(">>> backfill run #3 (restart on EMPTY processor): applied=%d rebuilt=%d done=%v (state reconstructed)\n",
+		st3.Applied, st3.Rebuilt, st3.Done)
+	freshHits := 0
+	for _, a := range p2.Alerts() {
+		freshHits += a.HitCount
+	}
+	liveHits := 0
+	for _, a := range p.Alerts() {
+		liveHits += a.HitCount
+	}
+	fmt.Printf(">>> after restart: session alerts=%d sum(unique_hits)=%d reconstructed from run files\n",
+		len(p2.Alerts()), freshHits)
+	fmt.Printf(">>> (live pipeline incl. pre-backfill realtime: alerts=%d hits=%d — out of the session's persistence scope)\n",
+		len(p.Alerts()), liveHits)
+
 	fmt.Println("\n===== alerts after backfill =====")
 	for _, a := range p.Alerts() {
 		fmt.Printf("key=%-42s rule=%-24s account=%s state=%-8s unique_hits=%d first=%s last=%s\n",
